@@ -17,6 +17,12 @@ class Config:
     learning_rate: float
     weight_decay: float
     auto_augment: str
+    mixup: bool
+    mixup_alpha: float
+    cutmix_alpha: float
+    mixup_prob: float
+    mixup_switch_prob: float
+    label_smoothing: float
     output_dir: Path
     seed: int
     amp: bool
@@ -44,6 +50,17 @@ def parse_config() -> Config:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--auto-augment", default="rand-m9-n3-mstd0.5")
     parser.add_argument(
+        "--mixup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Mixup/CutMix during training",
+    )
+    parser.add_argument("--mixup-alpha", type=float, default=0.8)
+    parser.add_argument("--cutmix-alpha", type=float, default=1.0)
+    parser.add_argument("--mixup-prob", type=float, default=1.0)
+    parser.add_argument("--mixup-switch-prob", type=float, default=0.5)
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
+    parser.add_argument(
         "--input-size",
         type=int,
         default=None,
@@ -64,6 +81,20 @@ def parse_config() -> Config:
         parser.error("--epochs must be at least 1")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.mixup and args.batch_size % 2 != 0:
+        parser.error("--batch-size must be even when Mixup/CutMix is enabled")
+    if args.mixup_alpha < 0:
+        parser.error("--mixup-alpha must be non-negative")
+    if args.cutmix_alpha < 0:
+        parser.error("--cutmix-alpha must be non-negative")
+    if args.mixup and args.mixup_alpha == 0 and args.cutmix_alpha == 0:
+        parser.error("Mixup/CutMix requires a positive alpha value")
+    if not 0 <= args.mixup_prob <= 1:
+        parser.error("--mixup-prob must be between 0 and 1")
+    if not 0 <= args.mixup_switch_prob <= 1:
+        parser.error("--mixup-switch-prob must be between 0 and 1")
+    if not 0 <= args.label_smoothing < 1:
+        parser.error("--label-smoothing must be in [0, 1)")
     if args.input_size is not None and args.input_size < 1:
         parser.error("--input-size must be at least 1")
 

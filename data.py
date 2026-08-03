@@ -54,6 +54,7 @@ def build_dataloaders(config: Config, model: nn.Module) -> DataBundle:
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True,
+        drop_last=config.mixup,
     )
     val_loader = DataLoader(
         val_dataset,
