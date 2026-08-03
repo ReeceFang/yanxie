@@ -2,6 +2,8 @@ set -e
 
 export OMP_NUM_THREADS=4
 
+# rm -r runs
+
 python train.py \
   --data-dir /root/autodl-tmp/yanxie_data \
   --model convnext_base \
