@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 
 MODEL_RE = re.compile(r"model=(.*?)\s*\|\s*classes=(.*?)\s*\|\s*train=")
+INPUT_SIZE_RE = re.compile(r"\binput_size=(None|\d+)")
 EPOCH_RE = re.compile(
     r"epoch\s+(?P<epoch>\d+)/\d+\s*\|\s*"
     r"train_loss=(?P<train_loss>[+\-\d.eE]+)\s*\|\s*"
@@ -40,6 +41,7 @@ EPOCH_RE = re.compile(
 class RunInfo:
     model_name: str
     classes: list[str]
+    input_size: int | None
     epochs: list[int]
     train_loss: list[float]
     train_acc: list[float]
@@ -81,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         "--input-size",
         type=int,
         default=None,
-        help="Override model input size if training used --input-size",
+        help="Override the input size recorded in the log (needed for older logs)",
     )
     parser.add_argument(
         "--device",
@@ -142,6 +144,7 @@ def parse_train_log(log_path: Path) -> RunInfo:
     model_line_index = -1
     model_name = ""
     classes: list[str] = []
+    input_size: int | None = None
 
     # A log may contain appended runs. Use the most recent run header and only
     # parse epochs after it.
@@ -157,6 +160,12 @@ def parse_train_log(log_path: Path) -> RunInfo:
         model_line_index = index
         model_name = match.group(1).strip()
         classes = parsed_classes
+        input_size_match = INPUT_SIZE_RE.search(line)
+        input_size = (
+            int(input_size_match.group(1))
+            if input_size_match and input_size_match.group(1) != "None"
+            else None
+        )
 
     if model_line_index < 0:
         raise ValueError(f"Could not find model/classes metadata in {log_path}")
@@ -180,6 +189,7 @@ def parse_train_log(log_path: Path) -> RunInfo:
     return RunInfo(
         model_name,
         classes,
+        input_size,
         epochs,
         train_loss,
         train_acc,
@@ -445,6 +455,13 @@ def main() -> None:
     run = parse_train_log(log_path)
     plot_training_curves(run, output_dir / "training_curves.png")
 
+    input_size = args.input_size if args.input_size is not None else run.input_size
+    if input_size is None:
+        print(
+            "Warning: this log does not record input_size. Using the model default. "
+            "If training used --input-size, pass the same value to test.py."
+        )
+
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available; use --device cpu")
@@ -454,7 +471,7 @@ def main() -> None:
         args.val_path,
         model,
         run.classes,
-        args.input_size,
+        input_size,
         args.batch_size,
         args.num_workers,
         pin_memory=device.type == "cuda",
@@ -475,12 +492,22 @@ def main() -> None:
         output_dir / "confusion_matrix_column_normalized.png",
     )
     accuracy = save_metrics_csv(confusion, run.classes, output_dir / "metrics.csv")
+    logged_best_accuracy = max(run.val_acc)
+    accuracy_difference = 100.0 * accuracy - logged_best_accuracy
 
     print(f"Model:      {run.model_name}")
     print(f"Checkpoint: {checkpoint_path}")
+    print(f"Input size:  {input_size if input_size is not None else 'model default'}")
     print(f"Samples:    {len(y_true)}")
     print(f"Accuracy:   {accuracy:.2%}")
+    print(f"Logged best:{logged_best_accuracy:8.2f}%")
+    print(f"Difference: {accuracy_difference:+8.2f} percentage points")
     print(f"Results:    {output_dir}")
+    if abs(accuracy_difference) > 0.1:
+        print(
+            "Warning: evaluated accuracy differs from the logged best accuracy. "
+            "Check that the validation data, input size, and checkpoint are unchanged."
+        )
 
 
 if __name__ == "__main__":

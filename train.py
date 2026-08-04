@@ -52,7 +52,8 @@ def main() -> None:
 
     logger.info(
         f"model={config.model} | classes={data.classes} | "
-        f"train={len(data.train_loader.dataset)} | val={len(data.val_loader.dataset)}"
+        f"train={len(data.train_loader.dataset)} | val={len(data.val_loader.dataset)} | "
+        f"input_size={config.input_size}"
     )
     logger.info(
         f"mixup={config.mixup} | mixup_alpha={config.mixup_alpha} | "
