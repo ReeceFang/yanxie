@@ -1,10 +1,10 @@
 """Evaluate a trained image classifier and export plots/CSV reports.
 
 Example:
-    python test.py --run-path runs/classifier --val-path data/val
+    python test.py --run-path runs/classifier --val-path data/val --weights best
 
 The run directory is expected to contain ``train.log`` and
-``best_model.pth`` (``last_model.pth`` is used as a fallback).
+the selected ``best_model.pth`` or ``last_model.pth`` checkpoint.
 """
 
 from __future__ import annotations
@@ -68,10 +68,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
+        "--weights",
+        choices=("best", "final"),
+        default="best",
+        help="Weights to evaluate: best_model.pth or final/last_model.pth (default: best)",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
-        help="Checkpoint path; default: best_model.pth, then last_model.pth",
+        help="Explicit checkpoint path; overrides --weights",
     )
     parser.add_argument(
         "--output-dir",
@@ -107,7 +113,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def locate_run_files(run_path: Path, checkpoint: Path | None) -> tuple[Path, Path, Path]:
+def locate_run_files(
+    run_path: Path,
+    weights: str,
+    checkpoint: Path | None,
+) -> tuple[Path, Path, Path]:
     run_path = run_path.expanduser().resolve()
     if run_path.is_file():
         if run_path.name != "train.log":
@@ -127,14 +137,13 @@ def locate_run_files(run_path: Path, checkpoint: Path | None) -> tuple[Path, Pat
             checkpoint_path = run_dir / checkpoint_path
         checkpoint_path = checkpoint_path.resolve()
     else:
-        best_path = run_dir / "best_model.pth"
-        last_path = run_dir / "last_model.pth"
-        checkpoint_path = best_path if best_path.is_file() else last_path
+        checkpoint_name = "best_model.pth" if weights == "best" else "last_model.pth"
+        checkpoint_path = run_dir / checkpoint_name
 
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
-            "Model checkpoint not found. Expected best_model.pth or last_model.pth "
-            f"under {run_dir}, or pass --checkpoint."
+            f"Selected model checkpoint not found: {checkpoint_path}. "
+            "Choose --weights best/final or pass --checkpoint explicitly."
         )
     return run_dir, log_path, checkpoint_path
 
@@ -443,7 +452,11 @@ def save_metrics_csv(matrix: np.ndarray, classes: list[str], path: Path) -> floa
 
 def main() -> None:
     args = parse_args()
-    run_dir, log_path, checkpoint_path = locate_run_files(args.run_path, args.checkpoint)
+    run_dir, log_path, checkpoint_path = locate_run_files(
+        args.run_path,
+        args.weights,
+        args.checkpoint,
+    )
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
