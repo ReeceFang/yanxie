@@ -301,17 +301,34 @@ def predict(
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     true_batches: list[np.ndarray] = []
-    pred_batches: list[np.ndarray] = []
+    top_prediction_batches: list[np.ndarray] = []
     use_amp = amp and device.type == "cuda"
 
     for images, labels in tqdm(loader, desc="Evaluating", unit="batch"):
         images = images.to(device, non_blocking=device.type == "cuda")
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            predictions = model(images).argmax(dim=1)
+            logits = model(images)
+            top_predictions = logits.topk(
+                k=min(3, logits.shape[1]),
+                dim=1,
+            ).indices
         true_batches.append(labels.numpy())
-        pred_batches.append(predictions.cpu().numpy())
+        top_prediction_batches.append(top_predictions.cpu().numpy())
 
-    return np.concatenate(true_batches), np.concatenate(pred_batches)
+    return np.concatenate(true_batches), np.concatenate(top_prediction_batches)
+
+
+def calculate_topk_accuracies(
+    y_true: np.ndarray,
+    top_predictions: np.ndarray,
+) -> dict[int, float]:
+    accuracies: dict[int, float] = {}
+    available_k = top_predictions.shape[1]
+    for requested_k in (1, 2, 3):
+        effective_k = min(requested_k, available_k)
+        correct = (top_predictions[:, :effective_k] == y_true[:, None]).any(axis=1)
+        accuracies[requested_k] = float(correct.mean())
+    return accuracies
 
 
 def make_confusion_matrix(
@@ -394,7 +411,12 @@ def safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
     )
 
 
-def save_metrics_csv(matrix: np.ndarray, classes: list[str], path: Path) -> float:
+def save_metrics_csv(
+    matrix: np.ndarray,
+    classes: list[str],
+    topk_accuracies: dict[int, float],
+    path: Path,
+) -> None:
     true_positive = np.diag(matrix).astype(np.float64)
     support = matrix.sum(axis=1)
     predicted = matrix.sum(axis=0)
@@ -405,6 +427,8 @@ def save_metrics_csv(matrix: np.ndarray, classes: list[str], path: Path) -> floa
     total = int(matrix.sum())
     correct = float(true_positive.sum())
     accuracy = correct / total
+    if not np.isclose(accuracy, topk_accuracies[1]):
+        raise ValueError("Top-1 accuracy does not match the confusion matrix")
     macro = (float(precision.mean()), float(recall.mean()), float(f1.mean()))
 
     # For single-label multiclass classification, micro precision/recall/F1
@@ -435,6 +459,12 @@ def save_metrics_csv(matrix: np.ndarray, classes: list[str], path: Path) -> floa
             )
         writer.writerow(["accuracy", "", "", "", total, f"{accuracy:.6f}"])
         writer.writerow(
+            ["top-2 accuracy", "", "", "", total, f"{topk_accuracies[2]:.6f}"]
+        )
+        writer.writerow(
+            ["top-3 accuracy", "", "", "", total, f"{topk_accuracies[3]:.6f}"]
+        )
+        writer.writerow(
             ["macro avg", f"{macro[0]:.6f}", f"{macro[1]:.6f}", f"{macro[2]:.6f}", total, ""]
         )
         writer.writerow(
@@ -447,7 +477,6 @@ def save_metrics_csv(matrix: np.ndarray, classes: list[str], path: Path) -> floa
                 "",
             ]
         )
-    return accuracy
 
 
 def main() -> None:
@@ -490,7 +519,9 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
     model.to(device)
-    y_true, y_pred = predict(model, loader, device, args.amp)
+    y_true, top_predictions = predict(model, loader, device, args.amp)
+    y_pred = top_predictions[:, 0]
+    topk_accuracies = calculate_topk_accuracies(y_true, top_predictions)
 
     confusion = make_confusion_matrix(y_true, y_pred, len(run.classes))
     save_raw_confusion_csv(
@@ -504,16 +535,25 @@ def main() -> None:
         run.classes,
         output_dir / "confusion_matrix_column_normalized.png",
     )
-    accuracy = save_metrics_csv(confusion, run.classes, output_dir / "metrics.csv")
-    logged_best_accuracy = max(run.val_acc)
-    accuracy_difference = 100.0 * accuracy - logged_best_accuracy
+    save_metrics_csv(
+        confusion,
+        run.classes,
+        topk_accuracies,
+        output_dir / "metrics.csv",
+    )
+    accuracy = topk_accuracies[1]
+    logged_accuracy = max(run.val_acc) if args.weights == "best" else run.val_acc[-1]
+    logged_accuracy_name = "best" if args.weights == "best" else "final"
+    accuracy_difference = 100.0 * accuracy - logged_accuracy
 
     print(f"Model:      {run.model_name}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Input size:  {input_size if input_size is not None else 'model default'}")
     print(f"Samples:    {len(y_true)}")
-    print(f"Accuracy:   {accuracy:.2%}")
-    print(f"Logged best:{logged_best_accuracy:8.2f}%")
+    print(f"Top-1 acc:  {topk_accuracies[1]:.2%}")
+    print(f"Top-2 acc:  {topk_accuracies[2]:.2%}")
+    print(f"Top-3 acc:  {topk_accuracies[3]:.2%}")
+    print(f"Logged {logged_accuracy_name + ':':<6}{logged_accuracy:8.2f}%")
     print(f"Difference: {accuracy_difference:+8.2f} percentage points")
     print(f"Results:    {output_dir}")
     if abs(accuracy_difference) > 0.1:
