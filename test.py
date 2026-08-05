@@ -308,10 +308,24 @@ def predict(
         images = images.to(device, non_blocking=device.type == "cuda")
         with torch.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
-            top_predictions = logits.topk(
-                k=min(3, logits.shape[1]),
-                dim=1,
-            ).indices
+            # Keep Top-1 identical to the training validation loop. ``argmax``
+            # and ``topk(k=3)`` may choose a different first class when reduced
+            # precision produces tied logits.
+            top1_predictions = logits.argmax(dim=1, keepdim=True)
+            remaining_k = min(2, logits.shape[1] - 1)
+            if remaining_k > 0:
+                remaining_logits = logits.clone()
+                remaining_logits.scatter_(1, top1_predictions, -torch.inf)
+                remaining_predictions = remaining_logits.topk(
+                    k=remaining_k,
+                    dim=1,
+                ).indices
+                top_predictions = torch.cat(
+                    (top1_predictions, remaining_predictions),
+                    dim=1,
+                )
+            else:
+                top_predictions = top1_predictions
         true_batches.append(labels.numpy())
         top_prediction_batches.append(top_predictions.cpu().numpy())
 
