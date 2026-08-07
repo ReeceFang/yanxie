@@ -1,0 +1,25 @@
+{
+  "changshi": ["huibaise changshi"],
+  "shiying": ["huibaise shiying", "qianhuise shiying", "zonghuangse shiying"],
+  "tanzhiniyan": ["huiheise tanzhiniyan"],
+  "baiyunshi": ["huihese baiyunshi"],
+  "huiyan": ["huihese huiyan"],
+  "niyan": [
+    "huilvse niyan",
+    "huise niyan",
+    "huise shazhi niyan",
+    "shenhuise niyan",
+    "zihongse niyan",
+    "zonghongse niyan"
+  ],
+  "changyingzhi shayan": [
+    "huizise changyingzhi shayan",
+    "qianhongse changyingzhi shayan",
+    "qianhuise changyingzhi shayan"
+  ],
+  "nizhi fenshayan": [
+    "qianhongse nizhi fenshayan",
+    "qianhuise nizhi fenshayan"
+  ],
+  "shazhi niyan": ["zonghongse shazhi niyan"]
+}
