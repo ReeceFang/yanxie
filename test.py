@@ -464,13 +464,27 @@ def save_metrics_csv(
                 ]
             )
 
-        # Top-K is a single overall hit rate rather than a per-class metric.
-        # Repeat it across the three requested metric columns to keep one
-        # consistent report layout without a separate accuracy column.
+        # Treat the K candidates per sample as multilabel predictions and
+        # report global (micro) Top-K precision/recall/F1. Since every sample
+        # has exactly one true label, Top-K recall equals Top-K accuracy, while
+        # precision divides the number of hits by K predictions per sample.
         for k in (1, 2, 3):
-            value = topk_accuracies[k]
+            topk_recall = topk_accuracies[k]
+            effective_k = min(k, len(classes))
+            topk_precision = topk_recall / effective_k
+            topk_f1 = (
+                2 * topk_precision * topk_recall / (topk_precision + topk_recall)
+                if topk_precision + topk_recall
+                else 0.0
+            )
             writer.writerow(
-                [f"Top-{k}", f"{value:.6f}", f"{value:.6f}", f"{value:.6f}", total]
+                [
+                    f"Top-{k}",
+                    f"{topk_precision:.6f}",
+                    f"{topk_recall:.6f}",
+                    f"{topk_f1:.6f}",
+                    total,
+                ]
             )
         writer.writerow(
             ["Macro", f"{macro[0]:.6f}", f"{macro[1]:.6f}", f"{macro[2]:.6f}", total]
