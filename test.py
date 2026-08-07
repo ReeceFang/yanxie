@@ -444,22 +444,15 @@ def save_metrics_csv(
     if not np.isclose(accuracy, topk_accuracies[1]):
         raise ValueError("Top-1 accuracy does not match the confusion matrix")
     macro = (float(precision.mean()), float(recall.mean()), float(f1.mean()))
-
-    # For single-label multiclass classification, micro precision/recall/F1
-    # are all equal to sample accuracy. Calculate them explicitly for clarity.
-    false_positive = float(predicted.sum() - correct)
-    false_negative = float(support.sum() - correct)
-    micro_precision = correct / (correct + false_positive)
-    micro_recall = correct / (correct + false_negative)
-    micro_f1 = (
-        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
-        if micro_precision + micro_recall
-        else 0.0
+    weighted = (
+        float(np.average(precision, weights=support)),
+        float(np.average(recall, weights=support)),
+        float(np.average(f1, weights=support)),
     )
 
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.writer(file)
-        writer.writerow(["class", "precision", "recall", "f1_score", "support", "accuracy"])
+        writer.writerow(["class", "precision", "recall", "f1_score", "support"])
         for index, class_name in enumerate(classes):
             writer.writerow(
                 [
@@ -468,27 +461,27 @@ def save_metrics_csv(
                     f"{recall[index]:.6f}",
                     f"{f1[index]:.6f}",
                     int(support[index]),
-                    "",
                 ]
             )
-        writer.writerow(["accuracy", "", "", "", total, f"{accuracy:.6f}"])
+
+        # Top-K is a single overall hit rate rather than a per-class metric.
+        # Repeat it across the three requested metric columns to keep one
+        # consistent report layout without a separate accuracy column.
+        for k in (1, 2, 3):
+            value = topk_accuracies[k]
+            writer.writerow(
+                [f"Top-{k}", f"{value:.6f}", f"{value:.6f}", f"{value:.6f}", total]
+            )
         writer.writerow(
-            ["top-2 accuracy", "", "", "", total, f"{topk_accuracies[2]:.6f}"]
-        )
-        writer.writerow(
-            ["top-3 accuracy", "", "", "", total, f"{topk_accuracies[3]:.6f}"]
-        )
-        writer.writerow(
-            ["macro avg", f"{macro[0]:.6f}", f"{macro[1]:.6f}", f"{macro[2]:.6f}", total, ""]
+            ["Macro", f"{macro[0]:.6f}", f"{macro[1]:.6f}", f"{macro[2]:.6f}", total]
         )
         writer.writerow(
             [
-                "micro avg",
-                f"{micro_precision:.6f}",
-                f"{micro_recall:.6f}",
-                f"{micro_f1:.6f}",
+                "Weight",
+                f"{weighted[0]:.6f}",
+                f"{weighted[1]:.6f}",
+                f"{weighted[2]:.6f}",
                 total,
-                "",
             ]
         )
 
