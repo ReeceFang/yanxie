@@ -1,0 +1,40 @@
+{
+  "shiying": {
+    "prompt": "观察岩石图像，判断它的颜色。只能是灰白色、浅灰色或棕黄色。",
+    "list": ["灰白色", "浅灰色", "棕黄色"],
+    "map": {
+      "灰白色": "huibaise shiying",
+      "浅灰色": "qianhuise shiying",
+      "棕黄色": "zonghuangse shiying"
+    }
+  },
+  "niyan": {
+    "prompt": "观察岩石图像，判断它的颜色。只能是灰绿色、灰色、深灰色、紫红色、棕红色或砂灰色。",
+    "list": ["灰绿色", "灰色", "深灰色", "紫红色", "棕红色", "砂灰色"],
+    "map": {
+      "灰绿色": "huilvse niyan",
+      "灰色": "huise niyan",
+      "深灰色": "shenhuise niyan",
+      "紫红色": "zihongse niyan",
+      "棕红色": "zonghongse niyan",
+      "砂灰色": "huise shazhi niyan"
+    }
+  },
+  "changyingzhi_shayan": {
+    "prompt": "观察岩石图像，判断它的颜色。只能是灰紫色、浅红色或浅灰色。",
+    "list": ["灰紫色", "浅红色", "浅灰色"],
+    "map": {
+      "灰紫色": "huizise changyingzhi shayan",
+      "浅红色": "qianhongse changyingzhi shayan",
+      "浅灰色": "qianhuise changyingzhi shayan"
+    }
+  },
+  "nizhi_fenshayan": {
+    "prompt": "观察岩石图像，判断它的颜色。只能是浅红色或浅灰色。",
+    "list": ["浅红色", "浅灰色"],
+    "map": {
+      "浅红色": "qianhongse nizhi fenshayan",
+      "浅灰色": "qianhuise nizhi fenshayan"
+    }
+  }
+}

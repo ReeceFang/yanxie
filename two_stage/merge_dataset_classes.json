@@ -3,7 +3,6 @@
   "niyan": [
     "huilvse niyan",
     "huise niyan",
-    "huise shazhi niyan",
     "shenhuise niyan",
     "zihongse niyan",
     "zonghongse niyan"
@@ -13,5 +12,9 @@
     "qianhongse changyingzhi shayan",
     "qianhuise changyingzhi shayan"
   ],
-  "nizhi_fenshayan": ["qianhongse nizhi fenshayan", "qianhuise nizhi fenshayan"]
+  "nizhi_fenshayan": [
+    "qianhongse nizhi fenshayan",
+    "qianhuise nizhi fenshayan"
+  ],
+  "shazhi_niyan": ["huise shazhi niyan", "zonghongse shazhi niyan"]
 }

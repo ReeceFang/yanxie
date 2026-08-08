@@ -7,3 +7,7 @@ temp_scripts/
 runs/
 
 *.tmp
+
+test/
+
+.env
