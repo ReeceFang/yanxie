@@ -1,4 +1,4 @@
-python merge_dataset_classes.py \
+python extract_dataset_classes.py \
   "/root/autodl-tmp/yanxie_data" \
-  "/root/autodl-tmp/yanxie_merged_data" \
-  "merge_dataset_classes_json.json"
+  "/root/autodl-tmp/yanxie_shiying_data" \
+  "extract_dataset_classes.txt"
