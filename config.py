@@ -27,6 +27,7 @@ class Config:
     seed: int
     amp: bool
     input_size: int | None = None
+    color_space: str = "rgb"
 
     @property
     def train_dir(self) -> Path:
@@ -65,6 +66,12 @@ def parse_config() -> Config:
         type=int,
         default=None,
         help="Override the model input image size (default: model configuration)",
+    )
+    parser.add_argument(
+        "--color-space",
+        choices=("rgb", "hsv", "lab"),
+        default="rgb",
+        help="Color space used for model input (default: rgb)",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("runs/classifier"))
     parser.add_argument("--seed", type=int, default=42)

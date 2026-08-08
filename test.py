@@ -1,7 +1,7 @@
 """Evaluate a trained image classifier and export plots/CSV reports.
 
 Example:
-    python test.py --run-path runs/classifier --val-path data/val --weights best
+    python test.py --run-path runs/classifier --data-dir data --weights best
 
 The run directory is expected to contain ``train.log`` and
 the selected ``best_model.pth`` or ``last_model.pth`` checkpoint.
@@ -12,18 +12,20 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import timm
 import torch
-from timm.data import create_transform, resolve_model_data_config
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
 from tqdm import tqdm
+
+from config import Config
+from data import build_dataloaders
+from model import build_model
 
 
 MODEL_RE = re.compile(r"model=(.*?)\s*\|\s*classes=(.*?)\s*\|\s*train=")
@@ -42,6 +44,7 @@ class RunInfo:
     model_name: str
     classes: list[str]
     input_size: int | None
+    config_values: dict[str, object] | None
     epochs: list[int]
     train_loss: list[float]
     train_acc: list[float]
@@ -60,13 +63,23 @@ def parse_args() -> argparse.Namespace:
         help="Run directory containing train.log and model weights",
     )
     parser.add_argument(
-        "--val-path",
+        "--data-dir",
         type=Path,
         required=True,
-        help="ImageFolder validation directory (one subdirectory per class)",
+        help="Dataset root containing train/ and val/",
     )
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override the batch size recorded in the log",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override the worker count recorded in the log",
+    )
     parser.add_argument(
         "--weights",
         choices=("best", "final"),
@@ -99,14 +112,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use automatic mixed precision on CUDA",
+        default=None,
+        help="Override the AMP setting recorded in the log",
     )
     args = parser.parse_args()
 
-    if args.batch_size < 1:
+    if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
-    if args.num_workers < 0:
+    if args.num_workers is not None and args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
     if args.input_size is not None and args.input_size < 1:
         parser.error("--input-size must be at least 1")
@@ -154,10 +167,19 @@ def parse_train_log(log_path: Path) -> RunInfo:
     model_name = ""
     classes: list[str] = []
     input_size: int | None = None
+    pending_config_values: dict[str, object] | None = None
+    config_values: dict[str, object] | None = None
 
     # A log may contain appended runs. Use the most recent run header and only
     # parse epochs after it.
     for index, line in enumerate(lines):
+        message = line.split(" | INFO | ", maxsplit=1)[-1].strip()
+        if message.startswith("config="):
+            parsed_config = json.loads(message.removeprefix("config="))
+            if not isinstance(parsed_config, dict):
+                raise ValueError(f"Invalid config entry in {log_path}")
+            pending_config_values = parsed_config
+
         match = MODEL_RE.search(line)
         if not match:
             continue
@@ -169,6 +191,10 @@ def parse_train_log(log_path: Path) -> RunInfo:
         model_line_index = index
         model_name = match.group(1).strip()
         classes = parsed_classes
+        config_values = (
+            pending_config_values.copy() if pending_config_values is not None else None
+        )
+        pending_config_values = None
         input_size_match = INPUT_SIZE_RE.search(line)
         input_size = (
             int(input_size_match.group(1))
@@ -199,11 +225,73 @@ def parse_train_log(log_path: Path) -> RunInfo:
         model_name,
         classes,
         input_size,
+        config_values,
         epochs,
         train_loss,
         train_acc,
         val_loss,
         val_acc,
+    )
+
+
+def build_test_config(
+    args: argparse.Namespace,
+    run: RunInfo,
+    checkpoint_path: Path,
+    output_dir: Path,
+) -> Config:
+    data_dir = args.data_dir.expanduser().resolve()
+
+    if run.config_values is not None:
+        config_values = run.config_values.copy()
+        for key, value in config_values.items():
+            if isinstance(value, str) and (
+                key.endswith("_dir") or key.endswith("_path")
+            ):
+                config_values[key] = Path(value)
+
+        # Keep the training configuration intact and override only values that
+        # necessarily belong to this evaluation run.
+        config_values.update(
+            data_dir=data_dir,
+            model=run.model_name,
+            model_path=checkpoint_path,
+            num_classes=len(run.classes),
+            output_dir=output_dir,
+        )
+        if args.batch_size is not None:
+            config_values["batch_size"] = args.batch_size
+        if args.num_workers is not None:
+            config_values["num_workers"] = args.num_workers
+        if args.input_size is not None:
+            config_values["input_size"] = args.input_size
+        if args.amp is not None:
+            config_values["amp"] = args.amp
+        return Config(**config_values)
+
+    # Backward-compatible values for logs created before the full Config JSON
+    # was recorded. input_size was already present in the old metadata line.
+    return Config(
+        data_dir=data_dir,
+        model=run.model_name,
+        model_path=checkpoint_path,
+        num_classes=len(run.classes),
+        epochs=1,
+        batch_size=args.batch_size if args.batch_size is not None else 32,
+        num_workers=args.num_workers if args.num_workers is not None else 4,
+        learning_rate=0.0,
+        weight_decay=0.0,
+        auto_augment="rand-m9-n3-mstd0.5",
+        mixup=False,
+        mixup_alpha=0.0,
+        cutmix_alpha=0.0,
+        mixup_prob=0.0,
+        mixup_switch_prob=0.0,
+        label_smoothing=0.0,
+        output_dir=output_dir,
+        seed=0,
+        amp=args.amp if args.amp is not None else True,
+        input_size=args.input_size if args.input_size is not None else run.input_size,
     )
 
 
@@ -236,60 +324,6 @@ def plot_training_curves(run: RunInfo, output_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-
-
-def load_model(model_name: str, num_classes: int, checkpoint_path: Path) -> torch.nn.Module:
-    model = timm.create_model(
-        model_name,
-        pretrained=False,
-        num_classes=num_classes,
-    )
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if isinstance(state_dict, dict) and "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"Unsupported checkpoint format: {checkpoint_path}")
-    if state_dict and all(key.startswith("module.") for key in state_dict):
-        state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
-    model.load_state_dict(state_dict, strict=True)
-    return model
-
-
-def build_val_loader(
-    val_path: Path,
-    model: torch.nn.Module,
-    expected_classes: list[str],
-    input_size: int | None,
-    batch_size: int,
-    num_workers: int,
-    pin_memory: bool,
-) -> DataLoader:
-    val_path = val_path.expanduser().resolve()
-    if not val_path.is_dir():
-        raise FileNotFoundError(f"Validation directory not found: {val_path}")
-
-    data_config = resolve_model_data_config(model)
-    if input_size is not None:
-        data_config["input_size"] = (3, input_size, input_size)
-    dataset = ImageFolder(
-        val_path,
-        transform=create_transform(**data_config, is_training=False),
-    )
-    if dataset.classes != expected_classes:
-        raise ValueError(
-            "Validation class folders do not match the training log.\n"
-            f"Training:   {expected_classes}\n"
-            f"Validation: {dataset.classes}"
-        )
-    if len(dataset) == 0:
-        raise ValueError(f"Validation dataset is empty: {val_path}")
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
 
 
 @torch.inference_mode()
@@ -443,6 +477,16 @@ def save_metrics_csv(
     accuracy = correct / total
     if not np.isclose(accuracy, topk_accuracies[1]):
         raise ValueError("Top-1 accuracy does not match the confusion matrix")
+    micro_true_positive = correct
+    micro_false_positive = float(predicted.sum() - correct)
+    micro_false_negative = float(support.sum() - correct)
+    micro_precision = micro_true_positive / (micro_true_positive + micro_false_positive)
+    micro_recall = micro_true_positive / (micro_true_positive + micro_false_negative)
+    micro_f1 = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if micro_precision + micro_recall
+        else 0.0
+    )
     macro = (float(precision.mean()), float(recall.mean()), float(f1.mean()))
     weighted = (
         float(np.average(precision, weights=support)),
@@ -466,11 +510,24 @@ def save_metrics_csv(
                 ]
             )
 
-        # Top-K is a ranking accuracy for single-label classification, not a
-        # standard precision/recall/F1 tuple. Store it in the shared value
-        # column and leave recall/F1 empty rather than mixing in retrieval-style
-        # Precision@K (whose maximum is 1/K).
-        for k in (1, 2, 3):
+        # Top-1 is ordinary single-label classification, so its global micro
+        # precision/recall/F1 are well-defined. They are mathematically equal
+        # to accuracy for a single-label multiclass task, but are calculated
+        # independently above from TP/FP/FN.
+        writer.writerow(
+            [
+                "Top-1",
+                f"{micro_precision:.6f}",
+                f"{micro_recall:.6f}",
+                f"{micro_f1:.6f}",
+                total,
+            ]
+        )
+
+        # Top-2/Top-3 are ranking accuracies, not standard classification
+        # precision/recall/F1 tuples. Store each accuracy in the shared value
+        # column and leave recall/F1 empty.
+        for k in (2, 3):
             topk_accuracy = topk_accuracies[k]
             writer.writerow(
                 [
@@ -513,29 +570,32 @@ def main() -> None:
     run = parse_train_log(log_path)
     plot_training_curves(run, output_dir / "training_curves.png")
 
-    input_size = args.input_size if args.input_size is not None else run.input_size
-    if input_size is None:
-        print(
-            "Warning: this log does not record input_size. Using the model default. "
-            "If training used --input-size, pass the same value to test.py."
-        )
-
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available; use --device cpu")
 
-    model = load_model(run.model_name, len(run.classes), checkpoint_path)
-    loader = build_val_loader(
-        args.val_path,
-        model,
-        run.classes,
-        input_size,
-        args.batch_size,
-        args.num_workers,
-        pin_memory=device.type == "cuda",
+    test_config = build_test_config(
+        args,
+        run,
+        checkpoint_path,
+        output_dir,
     )
+    if test_config.input_size is None:
+        print(
+            "Warning: this log does not record input_size. Using the model default. "
+            "If training used --input-size, pass the same value to test.py."
+        )
+    model = build_model(test_config, checkpoint_is_trained=True)
+    data = build_dataloaders(test_config, model)
+    if data.classes != run.classes:
+        raise ValueError(
+            "Dataset classes do not match the training log.\n"
+            f"Log:     {run.classes}\n"
+            f"Dataset: {data.classes}"
+        )
+    loader = data.val_loader
     model.to(device)
-    y_true, top_predictions = predict(model, loader, device, args.amp)
+    y_true, top_predictions = predict(model, loader, device, test_config.amp)
     y_pred = top_predictions[:, 0]
     topk_accuracies = calculate_topk_accuracies(y_true, top_predictions)
 
@@ -564,7 +624,10 @@ def main() -> None:
 
     print(f"Model:      {run.model_name}")
     print(f"Checkpoint: {checkpoint_path}")
-    print(f"Input size:  {input_size if input_size is not None else 'model default'}")
+    print(
+        f"Input size:  "
+        f"{test_config.input_size if test_config.input_size is not None else 'model default'}"
+    )
     print(f"Samples:    {len(y_true)}")
     print(f"Top-1 acc:  {topk_accuracies[1]:.2%}")
     print(f"Top-2 acc:  {topk_accuracies[2]:.2%}")

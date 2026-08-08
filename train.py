@@ -1,5 +1,9 @@
 """Single-GPU image-classification training entry point."""
 
+import json
+from dataclasses import asdict
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from timm.data import Mixup
@@ -21,6 +25,13 @@ def main() -> None:
 
     set_seed(config.seed)
     logger = setup_logger(config.output_dir)
+    config_values = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in asdict(config).items()
+    }
+    logger.info(
+        "config=" + json.dumps(config_values, ensure_ascii=False, sort_keys=True)
+    )
     model = build_model(config).cuda()
     data = build_dataloaders(config, model)
 
@@ -52,14 +63,7 @@ def main() -> None:
 
     logger.info(
         f"model={config.model} | classes={data.classes} | "
-        f"train={len(data.train_loader.dataset)} | val={len(data.val_loader.dataset)} | "
-        f"input_size={config.input_size}"
-    )
-    logger.info(
-        f"mixup={config.mixup} | mixup_alpha={config.mixup_alpha} | "
-        f"cutmix_alpha={config.cutmix_alpha} | prob={config.mixup_prob} | "
-        f"switch_prob={config.mixup_switch_prob} | "
-        f"label_smoothing={config.label_smoothing}"
+        f"train={len(data.train_loader.dataset)} | val={len(data.val_loader.dataset)}"
     )
 
     best_accuracy = -1.0

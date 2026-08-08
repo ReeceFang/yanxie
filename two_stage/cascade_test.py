@@ -1,10 +1,10 @@
-"""Evaluate a hard-routed two-stage image-classification cascade.
+"""Evaluate a soft-routed two-stage image-classification cascade.
 
-The first-stage model is trained on the merged dataset. Predictions whose
-class name is a key in the merge JSON are routed to ``<second-runs>/<key>``;
-all other predictions are final. Every prediction is mapped back to the class
-IDs of the original, unmerged ImageFolder validation dataset before metrics
-are calculated.
+The first-stage model is trained on the merged dataset. Its Top-K coarse
+classes form a candidate set. Direct classes retain their first-stage
+probability, while merged classes are expanded by ``P(group) * P(class|group)``
+using the corresponding second-stage model. The highest score in the original
+unmerged class space is the final prediction.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class RoutedImageDataset:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a hard-routed merged + second-stage classifier cascade"
+        description="Evaluate a Top-K soft-routed two-stage classifier cascade"
     )
     parser.add_argument(
         "--merged-run-path",
@@ -86,6 +86,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
+        "--route-top-k",
+        type=int,
+        default=2,
+        help="一级保留多少个粗类别参与软路由（默认：2）",
+    )
+    parser.add_argument(
+        "--stage1-temperature",
+        type=float,
+        default=1.0,
+        help="一级 softmax 温度，未校准时保持 1.0",
+    )
+    parser.add_argument(
+        "--stage2-temperature",
+        type=float,
+        default=1.0,
+        help="所有二级模型的 softmax 温度，未校准时保持 1.0",
+    )
+    parser.add_argument(
         "--weights",
         choices=("best", "final"),
         default="best",
@@ -95,7 +113,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="结果目录；默认为 <merged-run-path>/cascade_test_results",
+        help="结果目录；默认按 Top-K 写入独立的 cascade_soft_topK_results",
     )
     parser.add_argument(
         "--input-size",
@@ -120,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be at least 1")
     if args.num_workers < 0:
         parser.error("--num-workers cannot be negative")
+    if args.route_top_k < 1:
+        parser.error("--route-top-k must be at least 1")
+    if args.stage1_temperature <= 0:
+        parser.error("--stage1-temperature must be positive")
+    if args.stage2_temperature <= 0:
+        parser.error("--stage2-temperature must be positive")
     if args.input_size is not None and args.input_size < 1:
         parser.error("--input-size must be at least 1")
     return args
@@ -320,13 +344,14 @@ def predict_indexed_loader(
     device: Any,
     amp: bool,
     description: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    temperature: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return original sample indices and complete calibrated probabilities."""
     import torch
 
     model.eval()
     sample_index_batches: list[np.ndarray] = []
-    local_id_batches: list[np.ndarray] = []
-    confidence_batches: list[np.ndarray] = []
+    probability_batches: list[np.ndarray] = []
     use_amp = amp and device.type == "cuda"
 
     with torch.inference_mode():
@@ -334,19 +359,113 @@ def predict_indexed_loader(
             images = images.to(device, non_blocking=device.type == "cuda")
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 logits = model(images)
-            local_ids = logits.argmax(dim=1)
-            probabilities = logits.float().softmax(dim=1)
-            confidences = probabilities.gather(1, local_ids[:, None]).squeeze(1)
+            probabilities = (logits.float() / temperature).softmax(dim=1)
 
             sample_index_batches.append(sample_indices.numpy())
-            local_id_batches.append(local_ids.cpu().numpy())
-            confidence_batches.append(confidences.cpu().numpy())
+            probability_batches.append(probabilities.cpu().numpy())
 
     return (
         np.concatenate(sample_index_batches).astype(np.int64, copy=False),
-        np.concatenate(local_id_batches).astype(np.int64, copy=False),
-        np.concatenate(confidence_batches).astype(np.float64, copy=False),
+        np.concatenate(probability_batches).astype(np.float64, copy=False),
     )
+
+
+def initialize_soft_routes(
+    stage1_probabilities: np.ndarray,
+    merged_classes: list[str],
+    mapping: dict[str, list[str]],
+    global_class_to_id: dict[str, int],
+    route_top_k: int,
+) -> tuple[
+    np.ndarray,
+    dict[str, list[tuple[int, float]]],
+    np.ndarray,
+    np.ndarray,
+]:
+    """Create direct-class scores and collect merged Top-K candidates."""
+    if stage1_probabilities.ndim != 2:
+        raise ValueError("一级概率必须是二维矩阵")
+    if stage1_probabilities.shape[1] != len(merged_classes):
+        raise ValueError("一级概率列数与一级训练日志类别数不一致")
+    if not np.all(np.isfinite(stage1_probabilities)):
+        raise ValueError("一级概率中存在 NaN 或无穷值")
+    if np.any(stage1_probabilities < 0):
+        raise ValueError("一级概率不能为负数")
+
+    effective_k = min(route_top_k, len(merged_classes))
+    # There are only a few coarse classes, so a stable full sort is clearer and
+    # deterministic even when reduced-precision logits produce tied values.
+    top_ids = np.argsort(-stage1_probabilities, axis=1, kind="stable")[:, :effective_k]
+    top_probs = np.take_along_axis(stage1_probabilities, top_ids, axis=1)
+
+    sample_count = stage1_probabilities.shape[0]
+    global_scores = np.zeros(
+        (sample_count, len(global_class_to_id)), dtype=np.float64
+    )
+    routes: dict[str, list[tuple[int, float]]] = {
+        branch: [] for branch in mapping
+    }
+
+    for sample_index in range(sample_count):
+        for local_id, probability in zip(
+            top_ids[sample_index].tolist(),
+            top_probs[sample_index].tolist(),
+            strict=True,
+        ):
+            coarse_name = merged_classes[local_id]
+            if coarse_name in mapping:
+                routes[coarse_name].append((sample_index, probability))
+            else:
+                try:
+                    global_id = global_class_to_id[coarse_name]
+                except KeyError as exc:
+                    raise ValueError(
+                        f"一级普通类别无法映射到原始全局 ID: {coarse_name!r}"
+                    ) from exc
+                global_scores[sample_index, global_id] = probability
+
+    return global_scores, routes, top_ids, top_probs
+
+
+def apply_secondary_probabilities(
+    global_scores: np.ndarray,
+    branch: str,
+    sample_indices: np.ndarray,
+    branch_probabilities: np.ndarray,
+    secondary_probabilities: np.ndarray,
+    second_classes: dict[str, list[str]],
+    global_class_to_id: dict[str, int],
+) -> None:
+    """Write P(group) * P(original class | group) into global score space."""
+    classes = second_classes[branch]
+    if secondary_probabilities.shape != (len(sample_indices), len(classes)):
+        raise ValueError(f"二级分支 {branch!r} 返回的概率矩阵尺寸不正确")
+    if len(branch_probabilities) != len(sample_indices):
+        raise ValueError(f"二级分支 {branch!r} 的一级概率数量不正确")
+    if not np.all(np.isfinite(secondary_probabilities)):
+        raise ValueError(f"二级分支 {branch!r} 的概率中存在 NaN 或无穷值")
+    if np.any(secondary_probabilities < 0):
+        raise ValueError(f"二级分支 {branch!r} 的概率不能为负数")
+
+    for local_id, class_name in enumerate(classes):
+        try:
+            global_id = global_class_to_id[class_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"二级类别无法映射到原始全局 ID: {branch!r}/{class_name!r}"
+            ) from exc
+        global_scores[sample_indices, global_id] = (
+            branch_probabilities * secondary_probabilities[:, local_id]
+        )
+
+
+def normalize_global_scores(global_scores: np.ndarray) -> np.ndarray:
+    """Normalize the truncated Top-K score mass for confidence reporting."""
+    score_sums = global_scores.sum(axis=1, keepdims=True)
+    if np.any(score_sums <= 0):
+        missing_count = int((score_sums[:, 0] <= 0).sum())
+        raise RuntimeError(f"有 {missing_count} 个样本没有任何全局候选分数")
+    return global_scores / score_sums
 
 
 def make_confusion_matrix(
@@ -427,15 +546,17 @@ def save_predictions_csv(
     image_paths: list[str],
     y_true: np.ndarray,
     global_classes: list[str],
-    stage1_local_ids: np.ndarray,
+    mapping: dict[str, list[str]],
     merged_classes: list[str],
-    stage1_confidences: np.ndarray,
-    second_branches: list[str],
-    stage2_local_ids: np.ndarray,
-    stage2_class_names: list[str],
-    stage2_confidences: np.ndarray,
+    stage1_top_ids: np.ndarray,
+    stage1_top_probabilities: np.ndarray,
+    secondary_details: list[list[dict[str, Any]]],
     final_global_ids: np.ndarray,
+    final_probabilities: np.ndarray,
 ) -> None:
+    member_owner = {
+        member: branch for branch, members in mapping.items() for member in members
+    }
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.writer(file)
         writer.writerow(
@@ -443,38 +564,48 @@ def save_predictions_csv(
                 "image_path",
                 "true_global_id",
                 "true_class",
-                "stage1_local_id",
-                "stage1_class",
-                "stage1_confidence",
-                "stage2_run",
-                "stage2_local_id",
-                "stage2_class",
-                "stage2_confidence",
+                "true_coarse_class",
+                "true_coarse_in_stage1_topk",
+                "stage1_candidates",
+                "second_stage_details",
+                "winning_source",
                 "final_global_id",
                 "final_class",
+                "final_truncated_probability",
                 "correct",
             ]
         )
         for index, image_path in enumerate(image_paths):
             true_id = int(y_true[index])
-            stage1_id = int(stage1_local_ids[index])
-            stage2_id = int(stage2_local_ids[index])
+            true_class = global_classes[true_id]
+            true_coarse_class = member_owner.get(true_class, true_class)
             final_id = int(final_global_ids[index])
-            routed = stage2_id >= 0
+            final_class = global_classes[final_id]
+            stage1_candidates = [
+                {
+                    "rank": rank + 1,
+                    "local_id": int(local_id),
+                    "class": merged_classes[int(local_id)],
+                    "probability": round(
+                        float(stage1_top_probabilities[index, rank]), 8
+                    ),
+                }
+                for rank, local_id in enumerate(stage1_top_ids[index])
+            ]
+            candidate_names = {item["class"] for item in stage1_candidates}
             writer.writerow(
                 [
                     image_path,
                     true_id,
-                    global_classes[true_id],
-                    stage1_id,
-                    merged_classes[stage1_id],
-                    f"{stage1_confidences[index]:.6f}",
-                    second_branches[index] if routed else "",
-                    stage2_id if routed else "",
-                    stage2_class_names[index] if routed else "",
-                    f"{stage2_confidences[index]:.6f}" if routed else "",
+                    true_class,
+                    true_coarse_class,
+                    int(true_coarse_class in candidate_names),
+                    json.dumps(stage1_candidates, ensure_ascii=False),
+                    json.dumps(secondary_details[index], ensure_ascii=False),
+                    member_owner.get(final_class, "direct"),
                     final_id,
-                    global_classes[final_id],
+                    final_class,
+                    f"{final_probabilities[index, final_id]:.6f}",
                     int(final_id == true_id),
                 ]
             )
@@ -577,55 +708,60 @@ def run_cascade(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
-    stage1_indices, stage1_ids_ordered, stage1_conf_ordered = predict_indexed_loader(
+    stage1_indices, stage1_probs_ordered = predict_indexed_loader(
         merged_model,
         merged_loader,
         device,
         args.amp,
         "Stage 1",
+        args.stage1_temperature,
     )
-    stage1_local_ids = np.full(sample_count, -1, dtype=np.int64)
-    stage1_confidences = np.full(sample_count, np.nan, dtype=np.float64)
-    stage1_local_ids[stage1_indices] = stage1_ids_ordered
-    stage1_confidences[stage1_indices] = stage1_conf_ordered
-    if np.any(stage1_local_ids < 0):
+    stage1_probabilities = np.full(
+        (sample_count, len(merged_spec.info.classes)), np.nan, dtype=np.float64
+    )
+    stage1_probabilities[stage1_indices] = stage1_probs_ordered
+    if np.any(~np.isfinite(stage1_probabilities)):
         raise RuntimeError("一级推理没有返回全部样本")
     del merged_loader, merged_transform
     del merged_model
     _clear_model_memory(device)
 
-    routes: dict[str, list[int]] = {branch: [] for branch in mapping}
-    final_global_ids = np.full(sample_count, -1, dtype=np.int64)
-    second_branches = [""] * sample_count
-    stage2_local_ids = np.full(sample_count, -1, dtype=np.int64)
-    stage2_class_names = [""] * sample_count
-    stage2_confidences = np.full(sample_count, np.nan, dtype=np.float64)
-
-    for sample_index, local_id in enumerate(stage1_local_ids.tolist()):
-        branch, final_id = resolve_stage1_prediction(
-            local_id,
+    global_scores, routes, stage1_top_ids, stage1_top_probabilities = (
+        initialize_soft_routes(
+            stage1_probabilities,
             merged_spec.info.classes,
             mapping,
             global_class_to_id,
+            args.route_top_k,
         )
-        if branch is None:
-            if final_id is None:
-                raise RuntimeError("一级直接输出未生成全局 ID")
-            final_global_ids[sample_index] = final_id
-        else:
-            routes[branch].append(sample_index)
-            second_branches[sample_index] = branch
-
-    direct_count = int((final_global_ids >= 0).sum())
-    print(f"[3/5] 一级路由完成：直接输出 {direct_count} 个样本。")
-    for branch, indices in routes.items():
-        print(f"  {branch}: {len(indices)} 个样本进入二级分类器")
+    )
+    secondary_details: list[list[dict[str, Any]]] = [
+        [] for _ in range(sample_count)
+    ]
+    routed_sample_indices = {
+        sample_index
+        for routed_items in routes.values()
+        for sample_index, _ in routed_items
+    }
+    secondary_evaluation_count = sum(len(items) for items in routes.values())
+    print(
+        f"[3/5] Top-{stage1_top_ids.shape[1]} 软路由完成："
+        f"{len(routed_sample_indices)} 个样本需要二级推理，"
+        f"共 {secondary_evaluation_count} 次样本-分支计算。"
+    )
+    for branch, routed_items in routes.items():
+        print(f"  {branch}: {len(routed_items)} 个候选样本")
 
     print("[4/5] 正在逐个运行二级分类器...", flush=True)
-    for branch, routed_indices in routes.items():
-        if not routed_indices:
+    for branch, routed_items in routes.items():
+        if not routed_items:
             print(f"跳过二级分支 {branch}：没有路由样本。")
             continue
+
+        routed_indices = [sample_index for sample_index, _ in routed_items]
+        stage1_branch_probability = {
+            sample_index: probability for sample_index, probability in routed_items
+        }
 
         spec = second_specs[branch]
         second_model = load_model(
@@ -646,37 +782,55 @@ def run_cascade(args: argparse.Namespace) -> None:
             num_workers=args.num_workers,
             pin_memory=pin_memory,
         )
-        sample_indices, local_ids, confidences = predict_indexed_loader(
+        sample_indices, secondary_probabilities = predict_indexed_loader(
             second_model,
             second_loader,
             device,
             args.amp,
             f"Stage 2 [{branch}]",
+            args.stage2_temperature,
         )
-        for sample_index, local_id, confidence in zip(
-            sample_indices.tolist(),
-            local_ids.tolist(),
-            confidences.tolist(),
-            strict=True,
-        ):
-            class_name, global_id = resolve_secondary_prediction(
-                branch,
-                local_id,
-                second_classes,
-                global_class_to_id,
+        ordered_branch_probabilities = np.asarray(
+            [stage1_branch_probability[int(index)] for index in sample_indices],
+            dtype=np.float64,
+        )
+        apply_secondary_probabilities(
+            global_scores,
+            branch,
+            sample_indices,
+            ordered_branch_probabilities,
+            secondary_probabilities,
+            second_classes,
+            global_class_to_id,
+        )
+
+        top1_local_ids = secondary_probabilities.argmax(axis=1)
+        for row, sample_index in enumerate(sample_indices.tolist()):
+            local_id = int(top1_local_ids[row])
+            class_name = second_classes[branch][local_id]
+            conditional_probability = float(secondary_probabilities[row, local_id])
+            branch_probability = float(ordered_branch_probabilities[row])
+            secondary_details[sample_index].append(
+                {
+                    "branch": branch,
+                    "stage1_probability": round(branch_probability, 8),
+                    "top1_local_id": local_id,
+                    "top1_class": class_name,
+                    "top1_conditional_probability": round(
+                        conditional_probability, 8
+                    ),
+                    "top1_global_score": round(
+                        branch_probability * conditional_probability, 8
+                    ),
+                }
             )
-            stage2_local_ids[sample_index] = local_id
-            stage2_class_names[sample_index] = class_name
-            stage2_confidences[sample_index] = confidence
-            final_global_ids[sample_index] = global_id
 
         del second_loader, second_transform
         del second_model
         _clear_model_memory(device)
 
-    if np.any(final_global_ids < 0):
-        missing_count = int((final_global_ids < 0).sum())
-        raise RuntimeError(f"有 {missing_count} 个样本没有获得最终全局类别 ID")
+    final_probabilities = normalize_global_scores(global_scores)
+    final_global_ids = final_probabilities.argmax(axis=1).astype(np.int64)
     if not np.all((0 <= final_global_ids) & (final_global_ids < len(global_classes))):
         raise RuntimeError("最终预测中存在越界的全局类别 ID")
 
@@ -684,7 +838,8 @@ def run_cascade(args: argparse.Namespace) -> None:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else merged_spec.run_dir / "cascade_test_results"
+        else merged_spec.run_dir
+        / f"cascade_soft_top{stage1_top_ids.shape[1]}_results"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     confusion = make_confusion_matrix(y_true, final_global_ids, len(global_classes))
@@ -712,21 +867,41 @@ def run_cascade(args: argparse.Namespace) -> None:
         image_paths,
         y_true,
         global_classes,
-        stage1_local_ids,
+        mapping,
         merged_spec.info.classes,
-        stage1_confidences,
-        second_branches,
-        stage2_local_ids,
-        stage2_class_names,
-        stage2_confidences,
+        stage1_top_ids,
+        stage1_top_probabilities,
+        secondary_details,
         final_global_ids,
+        final_probabilities,
     )
 
+    member_owner = {
+        member: branch for branch, members in mapping.items() for member in members
+    }
+    true_coarse_classes = [
+        member_owner.get(global_classes[int(global_id)], global_classes[int(global_id)])
+        for global_id in y_true
+    ]
+    topk_hit_count = sum(
+        true_coarse in {
+            merged_spec.info.classes[int(local_id)]
+            for local_id in stage1_top_ids[index]
+        }
+        for index, true_coarse in enumerate(true_coarse_classes)
+    )
+    direct_winner_count = sum(
+        global_classes[int(global_id)] not in member_owner
+        for global_id in final_global_ids
+    )
     print(f"Merged model: {merged_spec.info.model_name}")
     print(f"Checkpoint:   {merged_spec.checkpoint_path}")
     print(f"Samples:      {sample_count}")
-    print(f"Direct:       {direct_count}")
-    print(f"Routed:       {sample_count - direct_count}")
+    print(f"Route Top-K:  {stage1_top_ids.shape[1]}")
+    print(f"Coarse hit:   {topk_hit_count / sample_count:.2%}")
+    print(f"2nd samples:  {len(routed_sample_indices)}")
+    print(f"2nd calls:    {secondary_evaluation_count}")
+    print(f"Direct wins:  {direct_winner_count}")
     print(f"Top-1 acc:    {accuracy:.2%}")
     print(f"Results:      {output_dir}")
 
