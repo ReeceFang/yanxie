@@ -452,7 +452,9 @@ def save_metrics_csv(
 
     with path.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.writer(file)
-        writer.writerow(["class", "precision", "recall", "f1_score", "support"])
+        writer.writerow(
+            ["class", "precision_or_top_k_accuracy", "recall", "f1_score", "support"]
+        )
         for index, class_name in enumerate(classes):
             writer.writerow(
                 [
@@ -464,25 +466,18 @@ def save_metrics_csv(
                 ]
             )
 
-        # Treat the K candidates per sample as multilabel predictions and
-        # report global (micro) Top-K precision/recall/F1. Since every sample
-        # has exactly one true label, Top-K recall equals Top-K accuracy, while
-        # precision divides the number of hits by K predictions per sample.
+        # Top-K is a ranking accuracy for single-label classification, not a
+        # standard precision/recall/F1 tuple. Store it in the shared value
+        # column and leave recall/F1 empty rather than mixing in retrieval-style
+        # Precision@K (whose maximum is 1/K).
         for k in (1, 2, 3):
-            topk_recall = topk_accuracies[k]
-            effective_k = min(k, len(classes))
-            topk_precision = topk_recall / effective_k
-            topk_f1 = (
-                2 * topk_precision * topk_recall / (topk_precision + topk_recall)
-                if topk_precision + topk_recall
-                else 0.0
-            )
+            topk_accuracy = topk_accuracies[k]
             writer.writerow(
                 [
                     f"Top-{k}",
-                    f"{topk_precision:.6f}",
-                    f"{topk_recall:.6f}",
-                    f"{topk_f1:.6f}",
+                    f"{topk_accuracy:.6f}",
+                    "",
+                    "",
                     total,
                 ]
             )

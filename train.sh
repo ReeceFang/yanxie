@@ -2,7 +2,7 @@ set -e
 
 export OMP_NUM_THREADS=4
 
-# rm -r runs
+# rm -r runs/classifier
 
 python train.py \
   --data-dir /root/autodl-tmp/yanxie_data \
