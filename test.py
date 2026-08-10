@@ -14,13 +14,14 @@ import ast
 import csv
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SequentialSampler
 from tqdm import tqdm
 
 from config import Config
@@ -379,6 +380,116 @@ def calculate_topk_accuracies(
     return accuracies
 
 
+def _unique_destination(directory: Path, filename: str) -> Path:
+    destination = directory / filename
+    if not destination.exists():
+        return destination
+
+    source_name = Path(filename)
+    counter = 2
+    while True:
+        candidate = directory / f"{source_name.stem}-{counter}{source_name.suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def save_result_images(
+    loader: DataLoader,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    classes: list[str],
+    output_dir: Path,
+) -> tuple[Path, int, int]:
+    """Copy source images into ground-truth class and correctness folders."""
+    if not isinstance(loader.sampler, SequentialSampler):
+        raise ValueError(
+            "Result images require a sequential validation sampler (shuffle=False)"
+        )
+    if loader.drop_last:
+        raise ValueError("Result images require drop_last=False for validation")
+    if y_true.ndim != 1 or y_pred.ndim != 1:
+        raise ValueError("y_true and y_pred must be one-dimensional arrays")
+
+    samples = getattr(loader.dataset, "samples", None)
+    if samples is None:
+        raise TypeError(
+            "Validation dataset must expose ImageFolder-compatible 'samples' paths"
+        )
+    if len(samples) != len(loader.dataset):
+        raise ValueError("Validation dataset length does not match dataset.samples")
+    if len(samples) != len(y_true) or len(y_true) != len(y_pred):
+        raise ValueError(
+            "Validation samples, true labels, and predictions have different lengths: "
+            f"samples={len(samples)}, y_true={len(y_true)}, y_pred={len(y_pred)}"
+        )
+
+    source_paths: list[Path] = []
+    dataset_labels: list[int] = []
+    for sample in samples:
+        if not isinstance(sample, (tuple, list)) or len(sample) < 2:
+            raise TypeError("Each dataset sample must contain an image path and label")
+        source_path = Path(sample[0]).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Source image not found: {source_path}")
+        source_paths.append(source_path)
+        dataset_labels.append(int(sample[1]))
+
+    dataset_labels_array = np.asarray(dataset_labels, dtype=np.int64)
+    if not np.array_equal(dataset_labels_array, y_true):
+        raise ValueError(
+            "Validation dataset label order does not match inference labels; "
+            "refusing to save mismatched images"
+        )
+
+    class_count = len(classes)
+    if class_count == 0:
+        raise ValueError("Class list is empty")
+    for class_name in classes:
+        if not class_name or class_name in {".", ".."} or Path(class_name).name != class_name:
+            raise ValueError(f"Unsafe class name for an output directory: {class_name!r}")
+    if np.any(y_true < 0) or np.any(y_true >= class_count):
+        raise ValueError("A true label index is outside the class list")
+    if np.any(y_pred < 0) or np.any(y_pred >= class_count):
+        raise ValueError("A predicted label index is outside the class list")
+
+    output_dir = output_dir.expanduser().resolve()
+    result_dir = output_dir / "result_image"
+    resolved_result_dir = result_dir.resolve()
+    if resolved_result_dir.parent != output_dir:
+        raise ValueError(
+            f"Unsafe result_image path outside the output directory: {resolved_result_dir}"
+        )
+    if result_dir.exists():
+        if result_dir.is_symlink() or not result_dir.is_dir():
+            raise ValueError(f"result_image is not a regular directory: {result_dir}")
+        shutil.rmtree(result_dir)
+
+    for class_name in classes:
+        (result_dir / class_name / "true").mkdir(parents=True, exist_ok=True)
+        (result_dir / class_name / "false").mkdir(parents=True, exist_ok=True)
+
+    correct_count = 0
+    for source_path, true_index, pred_index in zip(
+        source_paths,
+        y_true.tolist(),
+        y_pred.tolist(),
+        strict=True,
+    ):
+        true_name = classes[true_index]
+        pred_name = classes[pred_index]
+        is_correct = true_index == pred_index
+        correctness_dir = "true" if is_correct else "false"
+        destination_dir = result_dir / true_name / correctness_dir
+        output_name = f"{true_name}-{pred_name}-{source_path.name}"
+        destination = _unique_destination(destination_dir, output_name)
+        shutil.copy2(source_path, destination)
+        correct_count += int(is_correct)
+
+    incorrect_count = len(source_paths) - correct_count
+    return result_dir, correct_count, incorrect_count
+
+
 def make_confusion_matrix(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -598,6 +709,15 @@ def main() -> None:
     y_true, top_predictions = predict(model, loader, device, test_config.amp)
     y_pred = top_predictions[:, 0]
     topk_accuracies = calculate_topk_accuracies(y_true, top_predictions)
+    result_image_dir, correct_image_count, incorrect_image_count = (
+        save_result_images(
+            loader,
+            y_true,
+            y_pred,
+            run.classes,
+            output_dir,
+        )
+    )
 
     confusion = make_confusion_matrix(y_true, y_pred, len(run.classes))
     save_raw_confusion_csv(
@@ -635,6 +755,10 @@ def main() -> None:
     print(f"Logged {logged_accuracy_name + ':':<6}{logged_accuracy:8.2f}%")
     print(f"Difference: {accuracy_difference:+8.2f} percentage points")
     print(f"Results:    {output_dir}")
+    print(f"Images:     {result_image_dir}")
+    print(f"Saved:      {correct_image_count + incorrect_image_count}")
+    print(f"Correct:    {correct_image_count}")
+    print(f"Incorrect:  {incorrect_image_count}")
     if abs(accuracy_difference) > 0.1:
         print(
             "Warning: evaluated accuracy differs from the logged best accuracy. "

@@ -11,5 +11,3 @@ runs/
 test/
 
 .env
-
-two_stage/
